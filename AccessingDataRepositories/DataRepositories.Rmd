@@ -1,0 +1,450 @@
+---
+title: "Accessing Data Repositories in R (GBIF and iNat)"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, results = "hide", message = F}
+packages <- c("rgbif", "raster", "maps", "rgdal", "viridis", "picante", "rinat", "sp", "broom", "maptools", "ape", "tidyverse", "magrittr", "sf", "mapview")
+#lapply(packages, install.packages)
+sapply(packages, library, character.only = T)
+```
+
+## Introduction to iNaturalist
+## package::rinat
+#### Taxon level queries
+
+To query for specific species, use the `rinat::get_inat_obs` function.
+```{r}
+OCC <- get_inat_obs(taxon_name = "Lontra canadensis", maxresults = 25) 
+```
+You can query  by taxon name, taxon id (from iNat), or from a general query. The max number of results is set to 100 by default. Here I set it to 25 just to show a quick example.
+
+Take a look at the data.
+```{r}
+class(OCC)
+```
+```{r, results = "hide"}
+head(OCC)
+summary(OCC) 
+#OR
+str(OCC) #gives structure of object, can look messy at times but does give the class of each column
+```
+
+Queries can be further filtered by year (can only give one year, not a range, but there is a way around this for enterprising individuals...), month(s), status of georeferenced coordinates, and quality. Here I set quality to only those observations deemed research quality (determined when the wider iNaturalist community agrees on a species level ID). If you are using iNat to determine where a species is, you should probably only look at these results.
+
+```{r}
+OCC <- get_inat_obs(taxon_name = "Lontra canadensis", year = 2018, maxresults = 1000, quality = "research", geo = T)
+```
+
+Try plotting the coordinates of 2018 research grade otter observations. The `maps::map` function can prove helpful if you need quick boundaries and don't want to fuss with making a ggplot2 map. The database argument is set to "world" by default, but you can choose a few US options by changing it to "state" or "county."
+
+```{r}
+plot(OCC[, c("longitude", "latitude")], pch = 19, col = "red", cex = 0.5) #plots points
+maps::map(add = T) #plots world boundaries
+maps::map(add = T, "state") #plots US state boundaries
+```
+
+You can apply a bounding box to filter out observations (S-LAT, W-LON, N-LAT, E-LON). I created a bounding box below that essentially covers Texas.
+```{r}
+OCC <- get_inat_obs(taxon_name = "Lontra canadensis", geo = T, bounds = c(25, -106, 37, -94), maxresults = 1000)
+```
+
+Now you can see a general plot of otter observations in/around Texas.
+```{r, fig.dim = c(7, 7)}
+plot(OCC[, c("longitude", "latitude")], pch = 19, col = "red")
+maps::map(add = T, database = "county", "texas") #plots the county boundaries for the great Republic of Texas
+```
+
+#### Group level queries
+Besides querying for a specific species or taxonomic group, one can query for a specific iNaturalist group project (e.g., Herps of Texas or Mammals of Texas). 
+
+```{r, eval = F}
+#DON'T run the below code, it can take a while 
+MAMM <- get_inat_obs_project(grpid = "mammals-of-texas", type = "observations")
+```
+
+```{r}
+#DO RUN the below line to read a .csv file with the Mammals of Texas Project information
+MAMM <- read.csv("iNatMammals.csv", header = T)
+```
+```{r, results = "hide"}
+summary(MAMM) 
+```
+
+Check summary for User.login, Quality.grade, Scientific.name
+
+```{r, fig.dim = c(7, 7)}
+plot(MAMM[, c("Longitude", "Latitude")], pch = 19, col = "red") 
+```
+
+Well that seems to look like Texas.
+
+Let's take a look at trends by each county. iNat doesn't have explicit county data for each observation, so we'll create them. First, take out all those records without coordinates to make things easier on us. We'll use the `dplyr::filter` function for this. 
+```{r}
+MAMM <- filter(MAMM, !is.na(Longitude))
+```
+
+The above line checks for which rows have NA values (this the `is.na` function) for longitude and filters them out to only select those rows that are the opposite of it. The `!` symbol acts as a negator for logical values (the result of `is.na`), so it grabs those with coordinate data.
+
+The `raster::getData` function will grab the R equivalent of a shapefile of US county data (level 0 = country, level 1 = stateProvince, level 2 = county/municipality)
+```{r, message = F}
+CNTY <- raster::getData(country = "USA", level = 2) 
+class(CNTY) 
+```
+
+A SpatialPointsDataFrame has an associated data.frame (you can access the data.frame only by using CNTY\@data if you wish). Take a look at the NAME_1 and NAME_2 columns.
+```{r}
+head(CNTY) 
+head(CNTY$NAME_1) #state names
+head(CNTY$NAME_2) #county names
+```
+
+The below subsets the polygons to just Texas \*ComeAndTakeItFlagWaving.gif\* 
+```{r}
+CNTY <- CNTY[CNTY$NAME_1 %in% "Texas", ]
+```
+When subsetting a data.frame, you have a few options: 
+
+1) you can use the `base::subset` function
+```{r, eval = F}
+subset(CNTY, CNTY$NAME_1 == "Texas")
+```
+2) you can use `dplyr::filter`
+```{r, eval = F}
+filter(CNTY, NAME_1 == "Texas")
+```
+3) you can subset within square brackets
+```{r, eval = F}
+CNTY[CNTY$NAME_1 == "Texas", ] #(or how I did it above, the %in% symbol is necessary when you want to subset by multiple things, e.g., %in% c("Texas", "Louisiana"))
+```
+
+```{r}
+CNTY$NAME_2 
+```
+Oh, wow! A vector of Texas county names
+
+Turn the MAMM data.frame into a SpatialPointsDataFrame by specifying the coordinate columns. I found that this is easier than using `sp::SpatialPointsDataFrame`.
+```{r}
+coordinates(MAMM) <- ~Longitude + Latitude 
+```
+
+All coordinates from iNat are stored in unprojected lat/lon coordinates using the WGS84 datum, so you can grab the coordinate reference system from the county data.
+```{r}
+crs(MAMM) <- crs(CNTY)
+MAMM <- spTransform(MAMM, crs(CNTY))
+```
+
+The `raster::over` function is useful for determining what specific polygons (y argument, shown here as CNTY) a point in the x argument (here shown as MAMM) fall into.
+```{r}
+OVR <- over(MAMM, CNTY) 
+dim(OVR) 
+head(OVR)
+```
+This means you now have county information for each iNat record by simply writing out OVR$NAME_2
+
+Let's add that county information to our SpatialPointsDataFrame.
+```{r}
+MAMM@data <- cbind(MAMM@data, county = OVR$NAME_2) 
+```
+Grab the number of observations by county. 
+
+Hoo boy, time for an apply function explanation. For the below line, we are grabbing the vector of Texas county names and indexing the iNat mammal data by each county (this is what everything after function(x) is concerned with). `sapply` (results in a vector) and `lapply` (results in a list) have the following syntax: sapply(x, function(x) whatever function you can think up).
+
+So this is going county by county and counting up the number of observations.
+```{r}
+OBS <- sapply(CNTY$NAME_2, function(x) nrow(filter(MAMM@data, county == x)))
+```
+
+Grabs the number of species found in each county. This is similar to the line written to count observations, but instead further indexes by only grabbing the Scientific.name column and then grabs only the number of unique names in this column. 
+
+Soooo, you may be wondering what kind of mystical arts I'm attempting with `%$%` and `%>%`. I'm lazy, so I constructed a pipeline. Pipelines in R are created in using the handy `%>%` batch of symbols from the [magrittr](https://magrittr.tidyverse.org/) package. Essentially what it does is take the result from the left and use it as the first argument in whatever is after `%>%` (`%$%` is a special usage that only grabs a specific column or index from the left).
+
+```{r}
+SR <- sapply(CNTY$NAME_2, function(x) MAMM@data %>% filter(county == x) %$% Scientific.name %>% unique %>% length)
+```
+
+So essentially, we are doing `length(unique(filter(MAMM\@data, county = x)$Scientific.name))` but in an easier to read way (you can actually understand it from left to right).
+
+Ta-dah(rida)! Species richness
+
+One more thing...lets document how many unique users there are recording observations in each county.
+```{r}
+USER <- sapply(CNTY$NAME_2, function(x) MAMM@data %>% filter(county == x) %$% User.login %>% unique %>% length)
+```
+Place our observation, species richness, and user number vectors as columns within our SpatialPolygonsDataFrame of Texas counties.
+```{r}
+CNTY$inat.obs <- OBS 
+CNTY$inat.sr <- SR
+CNTY$inat.user <- USER
+```
+
+How about we visualize what we just wrought? ggplot2 is a fickle companion, so we will use the `broom::tidy` function to break down our observations and create a sort of choropleth map. `broom::tidy` will turn our SpatialPointsDataFrame into a regular data.frame and ID each row according to the region specified. This will allow the fill argument of the `ggplot2::aes` function to fill each county appropriately.
+```{r}
+OBSR <- tidy(CNTY, region = "inat.obs")
+class(OBSR$id)
+OBSR$id <- as.numeric(OBSR$id)
+```
+We don't want these numbers to be characters when filling in each polygon, so change them to numeric
+
+Those polygons with no observations will be set to NA so as to not confuse them with counties that only have a handful of observations
+```{r}
+OBSR[which(OBSR$id == 0), "id"] <- NA
+```
+```{r}
+SRR <- tidy(CNTY, region = "inat.sr")
+SRR$id <- as.numeric(SRR$id)
+SRR[which(SRR$id == 0), "id"] <- NA
+```
+```{r}
+USR <- tidy(CNTY, region = "inat.user")
+USR$id <- as.numeric(USR$id)
+USR[which(USR$id == 0), "id"] <- NA
+```
+
+Lists are great classes to store things in. Here we have the data.frames featuring county observation, species richness, and user numbers and can access each one by using `[[]]`.
+```{r}
+INAT <- list(OBSR, SRR, USR)
+```
+```{r}
+ggplot(data = INAT[[2]], aes(x = long, y = lat, fill = id, group = group)) + geom_polygon(color = "black", size = 0.2) + scale_fill_viridis(name = "iNaturalist Species Richness", option = "D", na.value = NA)
+```
+
+Now that we have county data associated with each record, you can subset the records by a specific county (such as Brazos Co.). You can use the `base::unique` function to determine which species are found in Brazos Co.
+```{r, eval = F}
+filter(MAMM@data, county == "Brazos")
+```
+```{r}
+MAMM@data %>% filter(county == "Brazos") %$% Scientific.name %>% unique
+```
+
+
+## Introduction to GBIF
+## package::rgbif
+
+```{r}
+CHAET <- occ_search(scientificName = "Chaetodipus hispidus", limit = 10)
+class(CHAET) 
+```
+Hmmm, it is a gbif class. Can't really review the information we want (presumably you want info regarding the record(s)).
+
+```{r}
+attributes(CHAET)
+CHAET$data
+```
+What is a tibble? It is a trimmed down data.frame. You can always change it to something that you are more familiar or comfortable with. 
+
+```{r}
+CHAET <- data.frame(CHAET$data)
+```
+```{r, eval = F}
+head(CHAET)
+```
+Well, that is a lot of data. Do we really need that much data? Do you REALLY want the vernacularName, license, and publishingCountry, for example?
+
+The summary of a vector of factors will give you a handy breakdown of what the vector is comprised of. Neat!
+```{r}
+summary(as.factor(CHAET$county))
+```
+
+Here we not only listed the set of fields that we wanted, but also only grabbed the $data portion and turned it into a data.frame in one line.
+```{r}
+CHAET <- occ_search(scientificName = "Chaetodipus hispidus", fields = c('name', 'infraspecificEpithet', 'stateProvince', 'country', 'county', 'locality', 'decimalLongitude', 'decimalLatitude', 'geodeticDatum', 'datasetName', 'institutionCode', 'recordNumber', 'catalogNumber', 'year', 'preparations'), limit = 10) %$% data %>% data.frame
+```
+
+But what if you wanted more than 200,000 records (the limit imposed by the draconian creators of the package)? \*thinkingfaceemoji\* This lapply function will call the `rgbif::occ_search` function twice, each with the country specified as each element of the CNTRY vector.
+```{r}
+CNTRY <- c("US", "MX")
+CHAET <- lapply(1:2, function(x) as.data.frame(occ_search(scientificName = "Chaetodipus hispidus", country = CNTRY[x], fields = c('name', 'stateProvince', 'country', 'county', 'locality', 'decimalLongitude', 'decimalLatitude', 'geodeticDatum', 'datasetName', 'institutionCode', 'recordNumber', 'catalogNumber', 'year', 'preparations'), limit = 15)$data))
+length(CHAET)
+```
+```{r, eval = F}
+CHAET 
+```
+This results in a list composed of *Chaetodipus hispidus* records from the US and from Mexico
+
+"But I don't want a list"
+
+The `base::do.call` function will apply the function specified in the first part of the argument to each portion of the list, thus binding the rows of each list element together. There are other methods to use a function like `base::rbind` or `base::cbind` on each element of a list (e.g., `plyr::rbind.fill`) but `base::do.call` is accessible to everyone and is simple to use.
+```{r}
+CHAET <- do.call(rbind, CHAET)
+dim(CHAET)
+```
+
+Searching using the taxonKey (always found in the url of the GBIF page of the group you are looking at) can be very helpful as well
+```{r}
+HMYD <- occ_search(taxonKey = 5504, limit = 20)
+HMYD
+```
+There are over 200,000 heteromyid records on GBIF. Look at all those cool species of *Dipodomys*, *Perognathus*, and *Chaetodipus*!
+
+What if you weren't interested in a particular species or family, but wanted to know what was in a particular institution? rgbif has you covered there as well
+
+```{r, eval = F}
+###DO NOT RUN the below code
+BRTC <- occ_search(taxonKey = 359, basisOfRecord = "PRESERVED_SPECIMEN", institutionCode = "TCWC", fields = c('name', 'stateProvince', 'country', 'county', 'locality', 'decimalLongitude', 'decimalLatitude', 'geodeticDatum', 'datasetName', 'institutionCode', 'recordNumber', 'catalogNumber', 'year', 'preparations'), limit = 200000)$data
+```
+
+The above code searches for taxonKey 359 (Mammalia) of PRESERVED_SPECIMENS (so not videos, pictures, or hearsay of a species) at the institutionCode formerly known as the TCWC (our Biodiversity Research and Teaching Collections is still considered the TCWC by GBIF)
+
+```{r}
+###DO RUN the below code instead
+BRTC <- read.csv("BRTCMammals.csv", header = T)
+dim(BRTC)
+summary(BRTC)
+```
+Look at all those *Peromyscus*! These data aren't up to date, but do include much of the BRTC Mammal collection.
+
+```{r}
+summary(BRTC$country) 
+length(unique(BRTC$country))
+```
+The BRTC Mammal collection houses specimens from over 70 countries.
+
+```{r}
+plot(BRTC[, c("decimalLongitude", "decimalLatitude")])
+maps::map(add = T)
+```
+
+Specimens with coordinate information are very US biased.
+
+Index the BRTC records to only pick those from Texas. You can use `dplyr::filter`, `base::subset`, or `%in%` to do this.
+
+```{r}
+TEX <- filter(BRTC, stateProvince == "Texas")
+summary(TEX)
+```
+```{r, message = F, echo = F, warning = F}
+BRTC %>% filter(stateProvince == "Texas" & !is.na(decimalLongitude)) %>% st_as_sf(coords = c("decimalLongitude", "decimalLatitude"), crs = 4326) %>% st_set_crs(NA) %>% st_set_crs(st_crs(as(CNTY, "sf"))) %>% st_transform(crs = st_crs(as(CNTY, "sf"))) %>% st_intersection(as(CNTY, "sf")) %>% mapview
+```
+
+Hmmm that doesn't seem quite right. Why is Aguascalientes and Alabama showing up in stateProvince. Use `base::droplevels` to get rid of unneeded levels when using the base::summary function.
+```{r}
+TEX <- droplevels(filter(BRTC, stateProvince == "Texas"))
+dim(TEX) 
+```
+
+Over 18,000 specimens from Texas
+
+```{r}
+plot(TEX[, c("decimalLongitude", "decimalLatitude")])
+```
+
+Looks like some specimens weren't georeferenced correctly. Let's ignore those.
+
+However, we have more county records (only 311 NA values) than coordinate records (7,953 NA values). Since georeferencing is not the goal of this module, we will visualize records and species richness at the county level.
+
+You've seen this before (hopefully you have been paying some modicum of attention). The `base::sapply` function takes each county name, subsets the BRTC Texas data with it and counts the unique species names found.
+```{r}
+SR <- sapply(CNTY$NAME_2, function(x) TEX %>% filter(county == x) %$% name %>% unique %>% length)
+```
+
+Same as above, but uses `base::nrow` to count the number of records per county.
+```{r}
+OBS <- sapply(CNTY$NAME_2, function(x) TEX %>% filter(county == x) %>% nrow)
+```
+
+```{r}
+CNTY$brtc.sr <- SR
+CNTY$brtc.obs <- OBS
+
+TSR <- tidy(CNTY, region = "brtc.sr")
+TSR$id <- as.numeric(TSR$id)
+TSR[which(TSR$id == 0), "id"] <- NA
+
+TOBS <- tidy(CNTY, region = "brtc.obs")
+TOBS$id <- as.numeric(TOBS$id)
+TOBS[which(TOBS$id == 0), "id"] <- NA
+
+DIV <- list(TSR, TOBS)
+```
+
+Again, the above several lines are creating a data.frame of the species richness and record values for each county in a way that ggplot2 can easily use to fill.
+
+```{r}
+ggplot(data = DIV[[1]], aes(x = long, y = lat, fill = id, group = group)) + geom_polygon(color = "black", size = 0.2) + scale_fill_viridis(name = "BRTC Mammal\nSpecies Richness", option = "D", na.value = NA)
+```
+
+You can use `\n` to create a return in a title in ggplot2.
+
+But not all species richness is created the same. Five *Peromyscus* species are different than a community that has marsupials, rodents, and cervids, for example. But how do we show this...
+Great question, follow below for more!
+
+The `ape::read.nexus` function will allow us to read in a nexus file that contains a phylogenetic tree. In this case, it is a tree of 5,020 mammal species from **S.A. Fritz et al. 2009. Ecology Letters. Geographical variation in predictors of mammalian extinction risk: Big is bad, but only in the tropics.**
+
+```{r}
+TREE <- read.nexus("ELE_1307_sm_SA1.nex")
+class(TREE) 
+summary(TREE)
+attributes(TREE)
+```
+
+This multiPhylo class is essentially a list that contains three different trees with different dates. For our purposes, we will use TREE$mammalST_MSW05_bestDates.
+
+```{r}
+summary(TREE$mammalST_MSW05_bestDates)
+```
+
+Shows number of tips, nodes, and branch length distribution
+
+```{r}
+attributes(TREE$mammalST_MSW05_bestDates)
+head(TREE$mammalST_MSW05_bestDates$tip.label)
+```
+
+If you notice, all tip label names for the tree have a "_" within them 
+
+Not so with our species names from GBIF. Could be a problem but it is a simple fix, so let's fix this!
+```{r}
+head(TEX$name)
+```
+
+Here we use the `base::sapply` function to split all names by a space and replace it with a _ using the `base::paste` function. `base::strsplit` only works on characters, so I had to use `base::as.character` to change the class of the TEX$name vector.
+```{r}
+TEX$name <- sapply(strsplit(as.character(TEX$name), " "), paste, collapse = "_")
+```
+
+Now comes the tricky part. Unfortunately the `picante::pd` function to determine phylogenetic diversity requires a community matrix, so we have to create one. Create a matrix of 0s with each row being a county name and each column being a species name and populate the empty row and column names with the names of the counties and species.
+
+```{r}
+SAMP <- matrix(0, nrow = length(CNTY$NAME_2), ncol = length(unique(TEX$name)))
+row.names(SAMP) <- CNTY$NAME_2
+colnames(SAMP) <- unique(TEX$name)
+```
+
+Then we create a for loop that goes to each county row and places a 1 in each species column that is in that county (because the species names are the column names, we can use "name" to reference both).
+```{r}
+for(i in 1:nrow(SAMP)) {
+	SAMP[i, unique(TEX[TEX$county %in% CNTY$NAME_2[i], "name"])] <- 1
+}
+
+SAMP <- SAMP[, colnames(SAMP)[!colnames(SAMP) %in% setdiff(colnames(SAMP), TREE$mammalST_MSW05_bestDates$tip.label)]]
+```
+
+The `picante::pd` function does not play well with species being found in the matrix that are not found in the tree. This also looks horrifying but is really quite simple. We find the difference between species names from the BRTC Mammal Collection and the tree tip labels using the `base::setdiff` function and then exclude the names that are not found in the tree.
+```{r}
+SAMP <- SAMP[, colnames(SAMP)[!colnames(SAMP) %in% setdiff(colnames(SAMP), TREE$mammalST_MSW05_bestDates$tip.label)]]
+```
+
+The `picante::pd` function returns a data.frame comprised of vectors of phylogenetic diversity (PD) and species richness (SR) for each county
+```{r}
+PD <- pd(SAMP, TREE$mammalST_MSW05_bestDates)
+head(PD)
+```
+
+Add it to our list
+```{r}
+CNTY$pd <- log(PD$PD)
+TPD <- tidy(CNTY, region = "pd")
+TPD$id <- as.numeric(TPD$id)
+TPD[which(TPD$id == 0), "id"] <- NA
+
+DIV <- list(TSR, TOBS, TPD)
+```
+Plot!
+```{r}
+ggplot(data = DIV[[3]], aes(x = long, y = lat, fill = id, group = group)) + geom_polygon(color = "black", size = 0.2) + scale_fill_viridis(name = "BRTC Phylogenetic Diversity", option = "D", na.value = NA) #find the light
+```
